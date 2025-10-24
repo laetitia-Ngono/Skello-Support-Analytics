@@ -1,0 +1,280 @@
+/* ============================================================
+   03_kpi_gold.sql
+   But : Construire les vues KPI (GOLD) pour le support Skello
+   Auteurs : toi :)
+   Prérequis : tables SILVER prêtes (FACT_CONVERSATIONS, FACT_CONVERSATION_PARTS)
+   ============================================================ */
+
+-- 0) CONTEXTE -------------------------------------------------
+USE DATABASE SKELLO_DEMO;         -- <-- remplace par ta base si besoin
+CREATE SCHEMA IF NOT EXISTS GOLD;
+USE SCHEMA GOLD;
+
+--  Inspecter les tables sources SILVER
+DESCRIBE TABLE SILVER.FACT_CONVERSATION_PARTS;
+DESCRIBE TABLE SILVER.FACT_CONVERSATIONS;
+
+/* -----------------------------------------------------------------
+   1) FRT Étape 1 : 1er message ADMIN par conversation
+   Rôle : repérer la 1ère réponse d’un agent (admin), hors bot
+   Utilité : prérequis pour calculer le First Response Time (FRT)
+   ----------------------------------------------------------------- */
+CREATE OR REPLACE VIEW VW_FIRST_ADMIN_REPLY AS
+SELECT
+  conversation_id,
+  MIN(created_at_utc) AS first_admin_msg_at_utc
+FROM SILVER.FACT_CONVERSATION_PARTS
+WHERE PART_GROUP = 'Message'
+  AND UPPER(author_type) = 'ADMIN'
+GROUP BY conversation_id;
+
+-- Test
+SELECT * FROM VW_FIRST_ADMIN_REPLY LIMIT 5;
+
+/* -----------------------------------------------------------------
+   2) FRT Étape 2 : calcul du First Response Time (FRT) en secondes
+   FRT = date 1er message admin - date création de la conversation
+   KPI prioritaire : % de conversations répondues < 5 minutes (300 s)
+   ----------------------------------------------------------------- */
+CREATE OR REPLACE VIEW VW_FIRST_RESPONSE AS
+SELECT
+  c.conversation_id,
+  c.created_at_utc                      AS created_at_ts,
+  r.first_admin_msg_at_utc,
+  DATEDIFF('second', c.created_at_utc, r.first_admin_msg_at_utc)
+    AS first_response_seconds
+FROM SILVER.FACT_CONVERSATIONS c
+LEFT JOIN VW_FIRST_ADMIN_REPLY r
+  ON r.conversation_id = c.conversation_id;
+
+-- Test
+SELECT * FROM VW_FIRST_RESPONSE LIMIT 5;
+
+/* -----------------------------------------------------------------
+   3) KPI hebdo par agent : CSAT, % < 5 min, volume
+   - Semaine ISO correcte : YEAROFWEEKISO + WEEKISO
+   - Affiche le prénom si DIM_AGENTS est remplie, sinon ID, sinon "Non attribué"
+   ----------------------------------------------------------------- */
+CREATE OR REPLACE VIEW VW_SUPPORT_WEEKLY AS
+SELECT
+  CONCAT(
+    YEAROFWEEKISO(c.created_at_utc), '-', LPAD(WEEKISO(c.created_at_utc), 2, '0')
+  ) AS iso_week,
+  c.assignee_id,
+  COALESCE(a.agent_name, TO_VARCHAR(c.assignee_id), 'Non attribué') AS agent,
+  AVG(c.csat_rating) AS csat_avg,
+  100 * AVG(CASE WHEN v.first_response_seconds <= 300 THEN 1 ELSE 0 END) AS pct_under_5min,
+  COUNT(*) AS conversations
+FROM SILVER.FACT_CONVERSATIONS c
+LEFT JOIN VW_FIRST_RESPONSE v
+  ON v.conversation_id = c.conversation_id
+LEFT JOIN SILVER.DIM_AGENTS a
+  ON a.agent_id = TO_VARCHAR(c.assignee_id)
+GROUP BY 1,2,3
+ORDER BY 1,3;
+
+-- Test
+SELECT * FROM VW_SUPPORT_WEEKLY ORDER BY iso_week, agent LIMIT 20;
+
+/* -----------------------------------------------------------------
+   4) Charge par jour/heure (heatmap)
+   4a) UTC : vue générique (utile pour comparaisons/exports)
+   4b) Europe/Paris : vue opérationnelle pour planifier le staffing
+   Bots exclus (mesure charge réelle humaine)
+   ----------------------------------------------------------------- */
+
+-- 4a) UTC
+CREATE OR REPLACE VIEW VW_ACTIVITY_HEATMAP AS
+SELECT
+  DAYNAME(created_at_utc)         AS weekday_utc,   -- Monday...Sunday
+  DATE_PART(hour, created_at_utc) AS hour_utc,      -- 0..23
+  author_type,
+  COUNT(*) AS messages
+FROM SILVER.FACT_CONVERSATION_PARTS
+WHERE PART_GROUP = 'Message'
+  AND UPPER(author_type) <> 'BOT'
+GROUP BY 1,2,3
+ORDER BY 1,2,3;
+
+-- 4b) Europe/Paris
+CREATE OR REPLACE VIEW VW_ACTIVITY_HEATMAP_PARIS AS
+WITH msgs AS (
+  SELECT
+    CONVERT_TIMEZONE('UTC','Europe/Paris', created_at_utc) AS created_at_paris,
+    author_type
+  FROM SILVER.FACT_CONVERSATION_PARTS
+  WHERE PART_GROUP = 'Message'
+    AND UPPER(author_type) <> 'BOT'
+)
+SELECT
+  DAYNAME(created_at_paris)         AS weekday_paris,
+  DATE_PART(hour, created_at_paris) AS hour_paris,
+  author_type,
+  COUNT(*) AS messages
+FROM msgs
+GROUP BY 1,2,3
+ORDER BY 1,2,3;
+
+-- Test
+SELECT * FROM VW_ACTIVITY_HEATMAP ORDER BY weekday_utc, hour_utc LIMIT 30;
+SELECT * FROM VW_ACTIVITY_HEATMAP_PARIS ORDER BY weekday_paris, hour_paris LIMIT 30;
+
+/* -----------------------------------------------------------------
+   5) Contrôles qualité 
+   ----------------------------------------------------------------- */
+
+-- 5.1 Conversations totales vs conversations avec FRT calculé
+SELECT
+  COUNT(*)                                    AS total_conversations,
+  COUNT(v.first_response_seconds)             AS conversations_avec_frt
+FROM SILVER.FACT_CONVERSATIONS c
+LEFT JOIN VW_FIRST_RESPONSE v
+  ON v.conversation_id = c.conversation_id;
+
+-- 5.2 Distribution FRT (ordre de grandeur)
+SELECT
+  APPROX_PERCENTILE(first_response_seconds, 0.5) AS frt_median_s,
+  APPROX_PERCENTILE(first_response_seconds, 0.9) AS frt_p90_s
+FROM VW_FIRST_RESPONSE;
+
+-- 5.3 Couverture CSAT
+SELECT
+  COUNT(*)           AS convos,
+  COUNT(csat_rating) AS csat_count,
+  AVG(csat_rating)   AS csat_avg
+FROM SILVER.FACT_CONVERSATIONS;
+
+-- 5.4 Volumes horaires (Paris) – Top heures d’affluence
+SELECT hour_paris, SUM(messages) AS messages
+FROM VW_ACTIVITY_HEATMAP_PARIS
+GROUP BY hour_paris
+ORDER BY messages DESC
+LIMIT 10;
+
+/* -----------------------------------------------------------------
+   6) Requêtes “fiche résultats” (tableaux à coller dans le rapport)
+   ----------------------------------------------------------------- */
+
+-- 6.1 Conversations par agent (classement)
+SELECT agent, assignee_id, SUM(conversations) AS conversations
+FROM VW_SUPPORT_WEEKLY
+GROUP BY agent, assignee_id
+ORDER BY conversations DESC;
+
+-- 6.2 % < 5 min par semaine (tendance)
+SELECT iso_week, AVG(pct_under_5min) AS pct_5min
+FROM VW_SUPPORT_WEEKLY
+GROUP BY iso_week
+ORDER BY iso_week;
+
+-- 6.3 Messages par heure (Paris) (courbe simple)
+SELECT hour_paris, SUM(messages) AS messages
+FROM VW_ACTIVITY_HEATMAP_PARIS
+GROUP BY hour_paris
+ORDER BY hour_paris;
+
+
+
+USE DATABASE SKELLO_DEMO;
+USE SCHEMA GOLD;
+
+CREATE OR REPLACE VIEW VW_AGENT_ACTIVITY_WEEKLY AS
+SELECT
+  TO_CHAR(DATE_TRUNC('week', p.created_at_utc), 'YYYY-IW') AS iso_week,
+  p.author_id                                              AS agent_id,
+  COUNT(*)                                                 AS admin_messages
+FROM SILVER.FACT_CONVERSATION_PARTS p
+WHERE UPPER(p.author_type) = 'ADMIN'
+  AND p.part_group = 'Message'
+GROUP BY 1,2;
+
+-- avec le prénom
+CREATE OR REPLACE VIEW VW_AGENT_ACTIVITY_WEEKLY_NAMED AS
+SELECT
+  a.agent_name,
+  w.*
+FROM VW_AGENT_ACTIVITY_WEEKLY w
+LEFT JOIN SILVER.DIM_AGENTS a
+  ON a.agent_id = w.agent_id;
+
+
+-- montrer qui répond le plus aux messages parmi les agents 
+
+-- Contexte
+USE DATABASE SKELLO_DEMO;
+USE SCHEMA GOLD;
+
+-- 1) Activité hebdo des auteurs ADMIN (hors bots)
+CREATE OR REPLACE VIEW GOLD.VW_AGENT_ACTIVITY_WEEKLY AS
+SELECT
+  TO_CHAR(DATE_TRUNC('WEEK', p.CREATED_AT_UTC), 'YYYY-IW') AS ISO_WEEK,
+  TO_VARCHAR(p.AUTHOR_ID)                                   AS AGENT_ID,
+  COUNT(*)                                                  AS ADMIN_MESSAGES
+FROM SKELLO_DEMO.SILVER.FACT_CONVERSATION_PARTS p
+WHERE UPPER(p.PART_GROUP) = 'MESSAGE'       -- on garde uniquement les messages
+  AND UPPER(p.AUTHOR_TYPE) = 'ADMIN'        -- envoyés par un humain côté Skello
+  -- (si jamais des bots sont taggés 'ADMIN' dans tes données, décommente la ligne suivante)
+  -- AND COALESCE(UPPER(p.AUTHOR_NAME), '') <> 'BOT'
+GROUP BY 1, 2;
+
+-- 2) Avec les prénoms (dimension agents)
+CREATE OR REPLACE VIEW GOLD.VW_AGENT_ACTIVITY_WEEKLY_NAMED AS
+SELECT
+  COALESCE(a.AGENT_NAME, w.AGENT_ID) AS AGENT_NAME,
+  a.TEAM,
+  w.ISO_WEEK,
+  w.AGENT_ID,
+  w.ADMIN_MESSAGES
+FROM GOLD.VW_AGENT_ACTIVITY_WEEKLY w
+LEFT JOIN SKELLO_DEMO.SILVER.DIM_AGENTS a
+  ON a.AGENT_ID = w.AGENT_ID;
+
+
+  -- Top agents par volume de réponses (toutes semaines confondues)
+SELECT AGENT_NAME, SUM(ADMIN_MESSAGES) AS MSGS
+FROM GOLD.VW_AGENT_ACTIVITY_WEEKLY_NAMED
+GROUP BY AGENT_NAME
+ORDER BY MSGS DESC
+LIMIT 20;
+
+-- Vue hebdo sur une période précise
+SELECT ISO_WEEK, AGENT_NAME, ADMIN_MESSAGES
+FROM GOLD.VW_AGENT_ACTIVITY_WEEKLY_NAMED
+WHERE ISO_WEEK BETWEEN '2021-37' AND '2021-44'
+ORDER BY ISO_WEEK, ADMIN_MESSAGES DESC;
+
+-- Focus sur Justine (5391224)
+SELECT *
+FROM GOLD.VW_AGENT_ACTIVITY_WEEKLY_NAMED
+WHERE AGENT_ID = '5391224'
+ORDER BY ISO_WEEK;
+
+
+-- Crtéation d'une vue pour les Alertes 
+CREATE OR REPLACE VIEW GOLD.VW_PROBLEMATIC_CONVERSATIONS AS
+SELECT
+  c.conversation_id,
+  c.assignee_id,
+  a.agent_name,
+  c.created_at_utc,
+  c.csat_rating,
+  fr.first_response_seconds / 60.0 AS first_response_minutes,
+  c.state,
+  
+  -- Flags d'alertes
+  CASE WHEN c.csat_rating <= 2 THEN TRUE ELSE FALSE END AS is_low_csat,
+  CASE WHEN fr.first_response_seconds > 900 THEN TRUE ELSE FALSE END AS is_slow_response,
+  CASE WHEN c.state = 'open' 
+       AND DATEDIFF('hour', c.created_at_utc, CURRENT_TIMESTAMP()) > 48 
+       THEN TRUE ELSE FALSE END AS is_stuck
+  
+FROM SILVER.FACT_CONVERSATIONS c
+LEFT JOIN GOLD.VW_FIRST_RESPONSE fr ON c.conversation_id = fr.conversation_id
+LEFT JOIN SILVER.DIM_AGENTS a ON c.assignee_id = a.agent_id
+WHERE c.assignee_id IN ('5217337', '5391224', '5440474', '5300290')
+  AND (
+    c.csat_rating <= 2 
+    OR fr.first_response_seconds > 900
+    OR (c.state = 'open' AND DATEDIFF('hour', c.created_at_utc, CURRENT_TIMESTAMP()) > 48)
+  )
+ORDER BY c.created_at_utc DESC;

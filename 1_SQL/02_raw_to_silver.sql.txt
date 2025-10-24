@@ -1,0 +1,87 @@
+-- Ce script prend les données brutes importées dans le schéma RAW et les transforme en données structurées et propres dans le schéma SILVER.
+-- Il crée aussi une table de dimension des agents (DIM_AGENTS) pour humaniser les rapports.
+
+USE WAREHOUSE wh_demo;
+USE DATABASE skello_demo;
+USE SCHEMA silver;
+
+
+CREATE OR REPLACE TABLE SILVER.FACT_CONVERSATIONS AS
+SELECT
+  /* Clé conversation : on force en texte pour rester homogène */
+  TO_VARCHAR(ID)                                       AS conversation_id,
+
+  /* Dates : ma table RAW a déjà des Timestamp_NTZ -> on les garde simple */
+  CAST(CREATED_AT AS TIMESTAMP_NTZ)                    AS created_at_utc,
+  CAST(UPDATED_AT AS TIMESTAMP_NTZ)                    AS updated_at_utc,
+
+  /* Champs simples */
+  STATE,
+  TYPE,
+  PRIORITY,
+  OPEN,
+  READ,
+  TAGS,
+
+  /* ASSIGNEE stocké en texte JSON -> on parse "en douceur" */
+  (TRY_PARSE_JSON(ASSIGNEE):id)::STRING                AS assignee_id,
+  (TRY_PARSE_JSON(ASSIGNEE):type)::STRING              AS assignee_type,
+
+  /* CSAT (CONVERSATION_RATING) aussi en texte JSON */
+  (TRY_PARSE_JSON(CONVERSATION_RATING):rating)::FLOAT              AS csat_rating,
+  (TRY_PARSE_JSON(CONVERSATION_RATING):created_at)::TIMESTAMP_NTZ  AS csat_created_at_utc,
+  (TRY_PARSE_JSON(CONVERSATION_RATING):teammate:id)::STRING        AS csat_teammate_id
+
+FROM RAW.CONVERSATIONS_RAW;
+SELECT COUNT(*) FROM SILVER.FACT_CONVERSATIONS;
+SELECT * FROM SILVER.FACT_CONVERSATIONS LIMIT 10;
+
+
+--  Table de dimension DIM_AGENTS : 
+-- Nos vues affichent des IDs (5217337, 5391224...) mais pas les noms des agents. Pour le dashboard de Lorette, il faut humaniser les rapports.
+
+--  On se positionne dans la bonne base (remplace si besoin)
+USE DATABASE SKELLO_DEMO;
+
+-- On se place dans le bon schéma
+USE SCHEMA SILVER;
+
+-- On crée la table de dimension (syntaxe adaptée à Snowflake)
+CREATE OR REPLACE TABLE DIM_AGENTS AS
+SELECT COLUMN1 AS agent_id, COLUMN2 AS agent_name, COLUMN3 AS team
+FROM VALUES
+  ('5217337', 'Héloise', 'Support'),
+  ('5391224', 'Justine', 'Support'),
+  ('5440474', 'Patrick', 'Support'),
+  ('5300290', 'Raphael', 'Support'),
+  ('Lorette', 'Lorette', 'Manager');
+
+-- Vérification
+SELECT * FROM DIM_AGENTS;
+
+
+
+-- Ce script correspond à la phase Silver de mon pipeline Snowflake.
+-- J’y transforme les données brutes de conversations Intercom en une table structurée FACT_CONVERSATIONS.
+--J’y nettoie les champs JSON, je formate les dates et je crée une table de dimension DIM_AGENTS pour relier les identifiants aux prénoms.
+-- Cette étape me permet d’obtenir des données prêtes à l’analyse, que je réutiliserai dans la couche Gold pour calculer mes KPI.
+
+-- Vérication de l'absence de Justine dans la table des agents constatiés sur les graphiques dans power BI
+USE DATABASE SKELLO_DEMO;
+USE SCHEMA SILVER;
+
+SELECT ASSIGNEE_ID, COUNT(*) AS nb_conversations
+FROM FACT_CONVERSATIONS
+WHERE ASSIGNEE_ID = '5391224'
+GROUP BY ASSIGNEE_ID;
+-- Justine n'est pas assignée 
+
+-- Parfois les IDs sont stockés en texte JSON, et il peut y avoir des espaces, ou un null masqué.
+SELECT DISTINCT ASSIGNEE_ID
+FROM FACT_CONVERSATIONS
+WHERE ASSIGNEE_ID LIKE '%5391224%';
+-- Toujours aucun résultat
+
+SELECT DISTINCT AUTHOR_ID, AUTHOR_TYPE
+FROM FACT_CONVERSATION_PARTS
+WHERE AUTHOR_ID = '5391224';

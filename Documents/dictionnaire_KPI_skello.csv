@@ -1,0 +1,5 @@
+﻿KPI ;DESCRIPTIONS;FORMULES ;OBJECTIF VISE
+First Response Time (FRT);Temps entre création de la conversation et première réponse admin;DATEDIFF('second', created_at_utc, first_admin_msg_at_utc);Mesurer la réactivité du support
+% < 5 min;Part des conversations dont le FRT ≤ 300 s;SUM(FRT ≤ 300) / COUNT(FRT);Suivre la rapidité de réponse
+CSAT moyen;Moyenne des notes données par les clients;AVG(csat_rating);Suivre la satisfaction client
+Messages par heure/jour;Volume d’activité hors bots;COUNT(messages);Identifier les pics de charge

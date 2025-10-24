@@ -1,0 +1,23 @@
+-- Nous allons structurer le projet selon l'architecture Medallion (Bronze-Silver-Gold), une best practice en Data Engineering : 
+-- RAW (Bronze) : Données brutes exactement comme dans les CSV
+-- SILVER : Données nettoyées, types corrigés, JSON parsé → prêtes pour l'analyse
+-- GOLD : Vues métier agrégées → prêtes pour le dashboard
+
+
+-- 1) Créer l'entrepôt de calcul (taille "X-SMALL" = économie)
+CREATE WAREHOUSE IF NOT EXISTS wh_demo  
+  WITH WAREHOUSE_SIZE = 'XSMALL' AUTO_SUSPEND = 60 AUTO_RESUME = TRUE; 
+  
+  ---Le warehouse XSMALL avec AUTO_SUSPEND permet d'optimiser les coûts : il s'éteint après 60 secondes d'inactivité.
+
+
+-- 2) Création de la base et du schéma
+CREATE DATABASE IF NOT EXISTS skello_demo;
+CREATE SCHEMA IF NOT EXISTS skello_demo.raw;  --- Données brutes
+CREATE SCHEMA IF NOT EXISTS skello_demo.silver; -- Données nettoyés / transformées
+CREATE SCHEMA IF NOT EXISTS skello_demo.gold;  -- Vues analytiques / KPI
+
+-- 3) Se positionner sur ce contexte
+USE WAREHOUSE wh_demo;
+USE DATABASE skello_demo;
+USE SCHEMA skello_demo.raw;

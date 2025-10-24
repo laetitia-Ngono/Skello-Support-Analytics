@@ -1,0 +1,35 @@
+-- Il prend la table RAW des events Intercom (RAW.CONVERSATION_PARTS_RAW) et la convertit en une table propre et typée (SILVER.FACT_CONVERSATION_PARTS) :
+-- IDs en texte uniforme, dates au bon format,JSON “AUTHOR” éclaté en colonnes (author_id, author_type),colonnes utiles renommées,prêt pour calculer FRT, volumes par heure/jour, etc.
+
+USE WAREHOUSE wh_demo;                 -- adapte si tu as un autre nom
+USE DATABASE skello_demo;              -- ou LO_DEMO chez toi
+USE SCHEMA silver;
+
+CREATE OR REPLACE TABLE SILVER.FACT_CONVERSATION_PARTS AS
+SELECT      --  Identifiants homogènes (on force en texte)
+  TO_VARCHAR(ID)                    AS part_id,                  -- clé de la part (message/événement)
+  TO_VARCHAR(CONVERSATION_ID)       AS conversation_id,          -- clé de la conversation 
+  CAST(CREATED_AT  AS TIMESTAMP_NTZ) AS created_at_utc,          -- date/heure de l’événement
+  CAST(UPDATED_AT  AS TIMESTAMP_NTZ) AS updated_at_utc,
+  PART_GROUP,                        -- Message / Assignment / Close / ...
+  TYPE           AS raw_type,
+
+  -- Auteur (JSON → colonnes simples)
+  (TRY_PARSE_JSON(AUTHOR):id)::STRING   AS author_id,
+  (TRY_PARSE_JSON(AUTHOR):type)::STRING AS author_type,  -- user / admin / bot
+
+  -- Assignation & PJ (conservés tels quels en texte)
+  ASSIGNED_TO,
+  ATTACHMENTS,
+
+  -- Notification
+  CAST(NOTIFIED_AT AS TIMESTAMP_NTZ)    AS notified_at_utc,
+
+  -- (facultatif) champs conversation_* si présents
+  CAST(CONVERSATION_CREATED_AT AS TIMESTAMP_NTZ) AS conversation_created_at_utc,
+  CAST(CONVERSATION_UPDATED_AT AS TIMESTAMP_NTZ) AS conversation_updated_at_utc
+
+FROM RAW.CONVERSATION_PARTS_RAW;
+
+SELECT COUNT(*) FROM SILVER.FACT_CONVERSATION_PARTS;
+SELECT * FROM SILVER.FACT_CONVERSATION_PARTS LIMIT 10;
